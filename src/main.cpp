@@ -251,7 +251,7 @@ void setup() {
   xTaskCreate(
     read_P1,
     "Read P1 port telegrams",
-    9000,
+    12000,
     NULL,
     1,
     NULL
