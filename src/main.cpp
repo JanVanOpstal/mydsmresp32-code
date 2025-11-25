@@ -16,6 +16,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <shellyudpserver.cpp>
+#include "esp_task_wdt.h"
 
 
 #include "netpowerdata.h"
@@ -36,6 +37,9 @@ void updateNetPower(int32_t np, int32_t l1, int32_t l2, int32_t l3) {
 #include <ESPAsyncWebServer.h>
 #include <myWebServer.h>
 
+//#Watchdog timer timeout
+#define WDT_TIMEOUT_SECONDS 10
+
 //#include <WiFi.h>
 #include "dsmr.h"
 
@@ -45,7 +49,6 @@ void updateNetPower(int32_t np, int32_t l1, int32_t l2, int32_t l3) {
 const int localPort = 1010; // listen for UDP packets on this port
 
 // Telegram type
-
 using MyData = ParsedData<
   /* FixedValue */ power_delivered,
   /* FixedValue */ power_returned,
@@ -69,6 +72,9 @@ static QueueHandle_t telegrams_queue;
 
 void postTelegram(void *parameters){
   String item;
+  // 1. Add this task to the Task Watchdog Timer (TWDT)
+  // The handle to the current task is available via xTaskGetCurrentTaskHandle()
+  esp_task_wdt_add(NULL); // Passing NULL adds the current task
 
   // Loop forever
   while(1){
@@ -93,6 +99,8 @@ void postTelegram(void *parameters){
         int httpResponseCode = http.POST("telegram=/" + item.substring(1));
         Serial.print("HTTPResponse: ");
         Serial.println(httpResponseCode);
+
+        esp_task_wdt_reset();
     }
 
     // Wait before trying again
@@ -233,6 +241,8 @@ void read_P1(void * parameters){
 void setup() {
   Serial.begin(115200); //.begin(115200, SERIAL_8N1, 18,19);
   SerialPort.begin(115200, SERIAL_8N1, 18, 17);
+  // Initialize WDT with a 5 second timeout and enable panic mode (reboot on timeout)
+  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
   telegrams_queue = xQueueCreate(telegrams_queue_len, sizeof(String));
 
     // Create mutex for net power data
