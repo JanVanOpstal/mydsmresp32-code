@@ -40,25 +40,23 @@ void updateNetPower(int32_t np, int32_t l1, int32_t l2, int32_t l3) {
 //#Watchdog timer timeout
 #define WDT_TIMEOUT_SECONDS 10
 
-//#include <WiFi.h>
-#include "dsmr.h"
-
 // Wifi
 #define WIFI_TIMEOUT_MS 20000;
 #define MAX_BYTES_PER_READ 2048;
 const int localPort = 1010; // listen for UDP packets on this port
 
-// Telegram type
-using MyData = ParsedData<
-  /* FixedValue */ power_delivered,
-  /* FixedValue */ power_returned,
-  /* FixedValue */ power_delivered_l1,
-  /* FixedValue */ power_delivered_l2,
-  /* FixedValue */ power_delivered_l3,
-  /* FixedValue */ power_returned_l1,
-  /* FixedValue */ power_returned_l2,
-  /* FixedValue */ power_returned_l3
->;
+/// @brief  DSMR type
+typedef struct {
+    int32_t power_delivered;
+    int32_t power_delivered_l1;
+    int32_t power_delivered_l2;
+    int32_t power_delivered_l3;
+    int32_t power_returned;
+    int32_t power_returned_l1;
+    int32_t power_returned_l2;
+    int32_t power_returned_l3;
+    uint32_t timestamp_ms;
+} p1_parsed_t;
 
 HardwareSerial SerialPort(2);
 WifiConfig wifiConfig;
@@ -150,6 +148,42 @@ void keepWiFiAlive(void * parameters){
   }
 }
 
+// Fallback parser (same naive scanning used previously) - extracted here for reuse
+static bool fallback_parse(const char *telegram, p1_parsed_t *out) {
+    if (!telegram || !out) return false;
+    memset(out, 0, sizeof(*out));
+    const char *p;
+    double v;
+    p = strstr(telegram, "1-0:1.7.0(");
+    if (p && sscanf(p, "1-0:1.7.0(%lf", &v) == 1) out->power_delivered = (int32_t)(v * 1000.0);
+    p = strstr(telegram, "1-0:21.7.0(");
+    if (p && sscanf(p, "1-0:21.7.0(%lf", &v) == 1) out->power_delivered_l1 = (int32_t)(v * 1000.0);
+    p = strstr(telegram, "1-0:41.7.0(");
+    if (p && sscanf(p, "1-0:41.7.0(%lf", &v) == 1) out->power_delivered_l2 = (int32_t)(v * 1000.0);
+    p = strstr(telegram, "1-0:61.7.0(");
+    if (p && sscanf(p, "1-0:61.7.0(%lf", &v) == 1) out->power_delivered_l3 = (int32_t)(v * 1000.0);
+    p = strstr(telegram, "1-0:2.7.0(");
+    if (p && sscanf(p, "1-0:2.7.0(%lf", &v) == 1) out->power_returned = (int32_t)(v * 1000.0);
+    p = strstr(telegram, "1-0:22.7.0(");
+    if (p && sscanf(p, "1-0:22.7.0(%lf", &v) == 1) out->power_returned_l1 = (int32_t)(v * 1000.0);
+    p = strstr(telegram, "1-0:42.7.0(");
+    if (p && sscanf(p, "1-0:42.7.0(%lf", &v) == 1) out->power_returned_l2 = (int32_t)(v * 1000.0);
+    p = strstr(telegram, "1-0:62.7.0(");
+    if (p && sscanf(p, "1-0:62.7.0(%lf", &v) == 1) out->power_returned_l3 = (int32_t)(v * 1000.0);
+    if (out->power_delivered != 0 
+      || out->power_returned != 0 
+      || out->power_delivered_l1 != 0
+      || out->power_returned_l1 != 0
+      || out->power_delivered_l2 != 0
+      || out->power_returned_l2 != 0
+      || out->power_delivered_l3 != 0
+      || out->power_returned_l3 != 0) {
+        out->timestamp_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        return true;
+    }
+    return false;
+}
+
 void read_P1(void * parameters){
 
   //while (SerialPort.available()){
@@ -181,21 +215,18 @@ void read_P1(void * parameters){
         }
 
         // Get Power from telegram
-        MyData data;
-        ParseResult<void> result = P1Parser::parse(&data, telegram.c_str(), telegram.length());
-        if (result.err) {
-          Serial.print("Error parsing telegram: ");
-          Serial.println(result.err);
-        }
-        else if (!data.all_present()) {
-          Serial.println("Not all data present");
+        p1_parsed_t data;
+        bool result = fallback_parse(telegram.c_str(), &data);
+
+        if (!result) {
+          Serial.print("Error parsing telegram");
         }
         else 
         {
-          int32_t netPower = (int32_t)data.power_delivered.int_val()-(int32_t)data.power_returned.int_val();
-          int32_t netPowerL1 = (int32_t)data.power_delivered_l1.int_val()-(int32_t)data.power_returned_l1.int_val();
-          int32_t netPowerL2 = (int32_t)data.power_delivered_l2.int_val()-(int32_t)data.power_returned_l2.int_val();
-          int32_t netPowerL3 = (int32_t)data.power_delivered_l3.int_val()-(int32_t)data.power_returned_l3.int_val();
+          int32_t netPower = data.power_delivered-data.power_returned;
+          int32_t netPowerL1 = data.power_delivered_l1-data.power_returned_l1;
+          int32_t netPowerL2 = data.power_delivered_l2-data.power_returned_l2;
+          int32_t netPowerL3 = data.power_delivered_l3-data.power_returned_l3;
           updateNetPower(netPower, netPowerL1, netPowerL2, netPowerL3);
 
           Serial.print("Power L1: ");
@@ -209,7 +240,7 @@ void read_P1(void * parameters){
           Serial.print(netPower);
           Serial.println(" W");
         }
-
+        
         telegram = "";
         Serial.println("Read Telegram!");
      }
