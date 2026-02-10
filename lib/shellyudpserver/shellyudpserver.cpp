@@ -16,7 +16,8 @@
 static const int UDP_PORT = 1010;
 static const char *DEVICE_ID = "esp32-shelly";
 WiFiUDP udp;
-SemaphoreHandle_t sendMutex;
+SemaphoreHandle_t sendMutex = NULL;
+static TaskHandle_t udp_task_handle = NULL;
 
 
 // float calculate_derived_value(int32_t power) {
@@ -80,21 +81,25 @@ void udp_server_task(void *param) {
                         xSemaphoreGive(netPowerMutex);
                     }
                     StaticJsonDocument<512> response;
+                    bool doSend = true;
                     if (strcmp(method, "EM.GetStatus") == 0) {
                         create_em_response(response, req_id, powers, 3);
                     } else if (strcmp(method, "EM1.GetStatus") == 0) {
                         create_em1_response(response, req_id, powers, 3);
                     } else {
-                        continue;
+                        doSend = false;
                     }
-                    Serial.printf("Sending UDP JSON: %s\n", response.as<String>().c_str());
-                    char outBuf[512];
-                    size_t outLen = serializeJson(response, outBuf, sizeof(outBuf));
-                    xSemaphoreTake(sendMutex, portMAX_DELAY);
-                    udp.beginPacket(udp.remoteIP(), udp.remotePort());
-                    udp.write((const uint8_t*)outBuf, outLen);
-                    udp.endPacket();
-                    xSemaphoreGive(sendMutex);
+
+                    if (doSend) {
+                        char outBuf[512];
+                        size_t outLen = serializeJson(response, outBuf, sizeof(outBuf));
+                        Serial.printf("Sending UDP JSON: %s\n", outBuf);
+                        if (sendMutex) xSemaphoreTake(sendMutex, portMAX_DELAY);
+                        udp.beginPacket(udp.remoteIP(), udp.remotePort());
+                        udp.write((const uint8_t*)outBuf, outLen);
+                        udp.endPacket();
+                        if (sendMutex) xSemaphoreGive(sendMutex);
+                    }
                 }
             }
         }
@@ -103,8 +108,37 @@ void udp_server_task(void *param) {
 }
 
 void start_udp_server() {
-    sendMutex = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(udp_server_task, "UDPServer", 4096, NULL, 1, NULL, 1);
+    if (udp_task_handle) {
+        // already started
+        return;
+    }
+
+    if (!sendMutex) {
+        sendMutex = xSemaphoreCreateMutex();
+    }
+
+    BaseType_t res = xTaskCreatePinnedToCore(udp_server_task, "UDPServer", 4096, NULL, 1, &udp_task_handle, 1);
+    if (res != pdPASS) {
+        Serial.println("Failed to create UDP server task");
+        if (sendMutex) {
+            vSemaphoreDelete(sendMutex);
+            sendMutex = NULL;
+        }
+        udp_task_handle = NULL;
+    }
+}
+
+void stop_udp_server() {
+    // Stop UDP and free resources
+    if (udp_task_handle) {
+        vTaskDelete(udp_task_handle);
+        udp_task_handle = NULL;
+    }
+    udp.stop();
+    if (sendMutex) {
+        vSemaphoreDelete(sendMutex);
+        sendMutex = NULL;
+    }
 }
 
 // In your setup() call start_udp_server() after WiFi is connected.

@@ -16,7 +16,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <shellyudpserver.cpp>
-#include "esp_task_wdt.h"
+//#include "esp_task_wdt.h"
 
 
 #include "netpowerdata.h"
@@ -38,7 +38,7 @@ void updateNetPower(int32_t np, int32_t l1, int32_t l2, int32_t l3) {
 #include <myWebServer.h>
 
 //#Watchdog timer timeout
-#define WDT_TIMEOUT_SECONDS 10
+//#define WDT_TIMEOUT_SECONDS 10
 
 // Wifi
 #define WIFI_TIMEOUT_MS 20000;
@@ -64,20 +64,31 @@ WifiConfig wifiConfig;
 MyWebServer myWebServer(&wifiConfig);
 static const uint8_t telegrams_queue_len = 5;
 
+// Maximum telegram size (chars) - matches MAX_BYTES_PER_READ
+#define TELEGRAM_MAX_LEN 2048
+
+typedef struct {
+  char buf[TELEGRAM_MAX_LEN + 1];
+} Telegram;
+
 static QueueHandle_t telegrams_queue;
 //SensorWebserver sensorWebServer;//&wifiConfig);
 //AsyncWebServer server(80);
 
 void postTelegram(void *parameters){
-  String item;
+  static Telegram item;
+  static char payload[TELEGRAM_MAX_LEN + 16];
+  static WiFiClient client;
+  static HTTPClient http;
   // 1. Add this task to the Task Watchdog Timer (TWDT)
   // The handle to the current task is available via xTaskGetCurrentTaskHandle()
-  esp_task_wdt_add(NULL); // Passing NULL adds the current task
+  // esp_task_wdt_add(NULL); // Passing NULL adds the current task
 
   // Loop forever
   while(1){
-    // See if there's a message in the queue (do not block)
-    if (xQueueReceive(telegrams_queue, (void *)&item, 0) == pdTRUE && WiFi.status() == WL_CONNECTED) {
+    // Only attempt to receive when WiFi is connected to avoid dropping messages
+    if (WiFi.status() == WL_CONNECTED) {
+      if (xQueueReceive(telegrams_queue, &item, 0) == pdTRUE) {
         WiFiClient client;
         HTTPClient http;
 
@@ -94,13 +105,21 @@ void postTelegram(void *parameters){
         //serializeJson(doc, jsonData);
         //Serial.println(jsonData);
         
-        int httpResponseCode = http.POST("telegram=/" + item.substring(1));
+        // Build payload without using dynamic String allocations
+        char payload[TELEGRAM_MAX_LEN + 16];
+        // Safely skip leading '/' if present to match original behavior
+        const char *body = item.buf[0] == '/' ? &item.buf[1] : item.buf;
+        snprintf(payload, sizeof(payload), "telegram=/%s", body);
+        int httpResponseCode = http.POST(payload);
         Serial.print("HTTPResponse: ");
         Serial.println(httpResponseCode);
+        http.end();
+        // we stored the telegram by value in the queue, nothing to free
 
-        esp_task_wdt_reset();
+        // esp_task_wdt_reset();
     }
 
+    }
     // Wait before trying again
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
@@ -196,27 +215,40 @@ void read_P1(void * parameters){
     //   Serial.println("unavailable");
     // }
     while(SerialPort.available()){
-      //Serial.println("Read Telegram");
-      static String telegram{""};
+      // Use a static char buffer to avoid dynamic allocations
+      static char telegram[TELEGRAM_MAX_LEN + 1];
+      static size_t tel_len = 0;
       const char incomingChar = SerialPort.read();
-      
-      telegram.concat(incomingChar);
-      //Serial.println(telegram);
+
+      if (tel_len < TELEGRAM_MAX_LEN) {
+        telegram[tel_len++] = incomingChar;
+      }
+
       if ('!' == incomingChar) {      /* checksum reached, wait for and read 6 more bytes then the telegram is received completely - see DSMR 5.0.2 ¶ 6.2 */
         while (SerialPort.available() < 6)
           vTaskDelay(1 / portTICK_PERIOD_MS);
 
-        while (SerialPort.available())
-          telegram.concat((char)SerialPort.read());
+        while (SerialPort.available()) {
+          char c = (char)SerialPort.read();
+          if (tel_len < TELEGRAM_MAX_LEN) {
+            telegram[tel_len++] = c;
+          }
+        }
 
-        //Serial.println(telegram);
-        if (xQueueSend(telegrams_queue, (void *)&telegram, 10) != pdTRUE){
+        telegram[tel_len] = '\0';
+
+        Telegram msg;
+        // copy and ensure NUL termination
+        strncpy(msg.buf, telegram, TELEGRAM_MAX_LEN);
+        msg.buf[TELEGRAM_MAX_LEN] = '\0';
+
+        if (xQueueSend(telegrams_queue, &msg, pdMS_TO_TICKS(10)) != pdTRUE){
           Serial.println("Queue full");
         }
 
         // Get Power from telegram
         p1_parsed_t data;
-        bool result = fallback_parse(telegram.c_str(), &data);
+        bool result = fallback_parse(telegram, &data);
 
         if (!result) {
           Serial.print("Error parsing telegram");
@@ -241,7 +273,7 @@ void read_P1(void * parameters){
           Serial.println(" W");
         }
         
-        telegram = "";
+        tel_len = 0;
         Serial.println("Read Telegram!");
      }
     }
@@ -273,8 +305,10 @@ void setup() {
   Serial.begin(115200); //.begin(115200, SERIAL_8N1, 18,19);
   SerialPort.begin(115200, SERIAL_8N1, 18, 17);
   // Initialize WDT with a 5 second timeout and enable panic mode (reboot on timeout)
-  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
-  telegrams_queue = xQueueCreate(telegrams_queue_len, sizeof(String));
+  //esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+  // Use queue of Telegram structs to avoid dynamic allocations.
+  // FreeRTOS queues copy raw bytes; we'll queue the Telegram buffer by value.
+  telegrams_queue = xQueueCreate(telegrams_queue_len, sizeof(Telegram));
 
     // Create mutex for net power data
     netPowerMutex = xSemaphoreCreateMutex();
@@ -301,7 +335,7 @@ void setup() {
   xTaskCreate(
     postTelegram,
     "Post telegrams",
-    6000,
+    8000,
     NULL,
     1,
     NULL
@@ -310,6 +344,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED)
   {
     vTaskDelay(pdMS_TO_TICKS(10)); // FreeRTOS: yield for 10ms
+    // esp_task_wdt_reset();
   }
   
   start_udp_server();

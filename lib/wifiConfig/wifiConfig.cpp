@@ -5,6 +5,7 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include "webPage.cpp"
+// #include "esp_task_wdt.h"
 
 
 WifiConfig::WifiConfig()
@@ -47,6 +48,7 @@ void WifiConfig::setSTAMode(){
       n += 1;
       vTaskDelay(100 / portTICK_PERIOD_MS);
       Serial.print(".");
+      //esp_task_wdt_reset();
     }
     Serial.println();
     if (WiFi.status() == WL_CONNECTED){
